@@ -23,6 +23,7 @@ class Settings:
     poll_timeout: int
     forward_media_immediately: bool
     clean_after_send: bool
+    forward_only_ephemeral: bool
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -50,6 +51,7 @@ def parse_settings() -> Settings:
     poll_timeout = int(os.getenv("POLL_TIMEOUT", "25"))
     forward_media_immediately = _parse_bool(os.getenv("FORWARD_MEDIA_IMMEDIATELY", "true"), True)
     clean_after_send = _parse_bool(os.getenv("CLEAN_AFTER_SEND", "true"), True)
+    forward_only_ephemeral = _parse_bool(os.getenv("FORWARD_ONLY_EPHEMERAL", "true"), True)
 
     return Settings(
         bot_token=bot_token,
@@ -59,6 +61,7 @@ def parse_settings() -> Settings:
         poll_timeout=poll_timeout,
         forward_media_immediately=forward_media_immediately,
         clean_after_send=clean_after_send,
+        forward_only_ephemeral=forward_only_ephemeral,
     )
 
 
@@ -299,6 +302,25 @@ def extract_media(message: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
+def is_ephemeral_media(message: Dict[str, Any], media_type: Optional[str]) -> bool:
+    # Telegram Bot API не даёт явного флага для view-once, но ttl_seconds появляется у self-destruct.
+    if message.get("ttl_seconds"):
+        return True
+    # Проверяем вложения на ttl_seconds, если поле есть.
+    if media_type:
+        media_obj = message.get(media_type)
+        if isinstance(media_obj, dict) and media_obj.get("ttl_seconds"):
+            return True
+        if isinstance(media_obj, list):
+            for item in media_obj:
+                if isinstance(item, dict) and item.get("ttl_seconds"):
+                    return True
+    # has_protected_content часто мешает пересылке — считаем как одноразовое для немедленной попытки.
+    if message.get("has_protected_content"):
+        return True
+    return False
+
+
 async def save_media(
     api: BotAPI, message: Dict[str, Any], media_dir: Path, connection_id: str
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -395,6 +417,7 @@ async def handle_business_message(
     text = bm.get("text") or bm.get("caption") or ""
     label = sender_label(bm)
     media_path, media_type = await save_media(api, bm, settings.media_dir, connection_id)
+    is_ephemeral = is_ephemeral_media(bm, media_type)
     await store.upsert_message(
         connection_id=connection_id,
         message_id=message_id,
@@ -406,16 +429,18 @@ async def handle_business_message(
         sender_label=label,
     )
 
-    if settings.forward_media_immediately and media_path and owner_chat:
-        caption = f"Медиа из чата {chat_id} от {label}"
-        await api.send_media_by_type(owner_chat, media_type or "document", Path(media_path), caption=caption)
-        if settings.clean_after_send:
-            await store.delete_message(connection_id, message_id)
-    elif settings.forward_media_immediately and media_type and not media_path and owner_chat:
-        await api.send_message(
-            owner_chat,
-            f"{label} отправил(а) медиа, но не удалось скачать файл (тип: {media_type}).",
-        )
+    if settings.forward_media_immediately and owner_chat:
+        should_forward = is_ephemeral or not settings.forward_only_ephemeral
+        if should_forward and media_path:
+            caption = f"Медиа из чата {chat_id} от {label}"
+            await api.send_media_by_type(owner_chat, media_type or "document", Path(media_path), caption=caption)
+            if settings.clean_after_send:
+                await store.delete_message(connection_id, message_id)
+        elif should_forward and media_type and not media_path:
+            await api.send_message(
+                owner_chat,
+                f"{label} отправил(а) медиа, но не удалось скачать файл (тип: {media_type}).",
+            )
 
 
 async def handle_edited_business_message(
