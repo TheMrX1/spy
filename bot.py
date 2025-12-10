@@ -189,7 +189,7 @@ class Store:
         async with self.lock:
             cur = self.conn.execute(
                 """
-                SELECT connection_id, message_id, chat_id, sender_id, text, media_path, media_type
+                SELECT connection_id, message_id, chat_id, sender_id, text, media_path, media_type, sender_label
                 FROM messages
                 WHERE connection_id = ? AND message_id = ?
                 """,
@@ -206,7 +206,7 @@ class Store:
             "text": row[4],
             "media_path": row[5],
             "media_type": row[6],
-            "sender_label": row[7] if len(row) > 7 else None,
+            "sender_label": row[7],
         }
 
     async def delete_message(self, connection_id: str, message_id: int) -> None:
@@ -257,6 +257,12 @@ class BotAPI:
     async def send_message(self, chat_id: int, text: str) -> None:
         await self._request("sendMessage", params={"chat_id": chat_id, "text": text})
 
+    async def send_message_fmt(self, chat_id: int, text: str, parse_mode: Optional[str] = None) -> None:
+        params: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        await self._request("sendMessage", params=params)
+
     async def send_document(self, chat_id: int, file_path: Path, caption: Optional[str] = None) -> None:
         await self._request(
             "sendDocument",
@@ -306,7 +312,6 @@ def is_ephemeral_media(message: Dict[str, Any], media_type: Optional[str]) -> bo
     # Telegram Bot API не даёт явного флага для view-once, но ttl_seconds появляется у self-destruct.
     if message.get("ttl_seconds"):
         return True
-    # Проверяем вложения на ttl_seconds, если поле есть.
     if media_type:
         media_obj = message.get(media_type)
         if isinstance(media_obj, dict) and media_obj.get("ttl_seconds"):
@@ -315,10 +320,15 @@ def is_ephemeral_media(message: Dict[str, Any], media_type: Optional[str]) -> bo
             for item in media_obj:
                 if isinstance(item, dict) and item.get("ttl_seconds"):
                     return True
-    # has_protected_content часто мешает пересылке — считаем как одноразовое для немедленной попытки.
-    if message.get("has_protected_content"):
-        return True
     return False
+
+
+def html_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 async def save_media(
@@ -418,6 +428,11 @@ async def handle_business_message(
     label = sender_label(bm)
     media_path, media_type = await save_media(api, bm, settings.media_dir, connection_id)
     is_ephemeral = is_ephemeral_media(bm, media_type)
+    if not is_ephemeral and bm.get("has_protected_content") and not media_path:
+        is_ephemeral = True
+    if not is_ephemeral and not media_path and any(bm.get(k) for k in ["photo", "video", "document", "animation", "video_note"]):
+        # есть медиа, но file_id не дали — вероятно view-once
+        is_ephemeral = True
     await store.upsert_message(
         connection_id=connection_id,
         message_id=message_id,
@@ -441,6 +456,11 @@ async def handle_business_message(
                 owner_chat,
                 f"{label} отправил(а) медиа, но не удалось скачать файл (тип: {media_type}).",
             )
+        elif should_forward and not media_type:
+            await api.send_message(
+                owner_chat,
+                f"{label} отправил(а) одноразовое медиа, но Telegram не дал file_id (view-once/TTL).",
+            )
 
 
 async def handle_edited_business_message(
@@ -453,16 +473,16 @@ async def handle_edited_business_message(
         return
     old = await store.get_message(connection_id, message_id)
     new_text = ebm.get("text") or ebm.get("caption") or ""
-    label = sender_label(ebm)
+    label = (old["sender_label"] if old and old.get("sender_label") else None) or sender_label(ebm)
     if old and old["text"] != new_text and owner_chat:
         before = old["text"] or "<пусто>"
         after = new_text or "<пусто>"
         body = (
-            f"{label} изменил(а) сообщение:\n\n"
-            f"До:\n«{before}»\n\n"
-            f"После:\n«{after}»"
+            f"{html_escape(label)} изменил(а) сообщение:\n\n"
+            f"Старое:<blockquote>{html_escape(before)}</blockquote>\n\n"
+            f"Новое:<blockquote>{html_escape(after)}</blockquote>"
         )
-        await api.send_message(owner_chat, body)
+        await api.send_message_fmt(owner_chat, body, parse_mode="HTML")
         if settings.clean_after_send:
             await store.delete_message(connection_id, message_id)
             return
@@ -493,11 +513,11 @@ async def handle_deleted_business_messages(
         text = saved["text"] or "<без текста>"
         label = saved.get("sender_label") or f"user {saved.get('sender_id')}"
         body = (
-            f"{label} удалил(а) сообщение:\n"
+            f"{html_escape(label)} удалил(а) сообщение:\n"
             f"Чат: {saved['chat_id']}\n\n"
-            f"Текст:\n«{text}»"
+            f"Текст:\n<blockquote>{html_escape(text)}</blockquote>"
         )
-        await api.send_message(owner_chat, body)
+        await api.send_message_fmt(owner_chat, body, parse_mode="HTML")
         if saved["media_path"]:
             await api.send_media_by_type(
                 owner_chat,
@@ -550,5 +570,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        print("Остановлено пользователем.")
+        print("Stopped by user.")
 
