@@ -99,13 +99,23 @@ class Store:
                 text TEXT,
                 media_path TEXT,
                 media_type TEXT,
+                sender_label TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (connection_id, message_id)
             )
             """
         )
+        # миграция: добавляем колонку sender_label при обновлении
+        self._ensure_column("messages", "sender_label", "TEXT")
         self.conn.commit()
         self.lock = asyncio.Lock()
+
+    def _ensure_column(self, table: str, column: str, coltype: str) -> None:
+        cur = self.conn.execute(f"PRAGMA table_info({table})")
+        cols = [row[1] for row in cur.fetchall()]
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            self.conn.commit()
 
     async def save_owner(self, owner_id: int, chat_id: int, username: Optional[str]) -> None:
         async with self.lock:
@@ -160,14 +170,15 @@ class Store:
         text: str,
         media_path: Optional[str],
         media_type: Optional[str],
+        sender_label: Optional[str],
     ) -> None:
         async with self.lock:
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO messages (connection_id, message_id, chat_id, sender_id, text, media_path, media_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO messages (connection_id, message_id, chat_id, sender_id, text, media_path, media_type, sender_label)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (connection_id, message_id, chat_id, sender_id, text, media_path, media_type),
+                (connection_id, message_id, chat_id, sender_id, text, media_path, media_type, sender_label),
             )
             self.conn.commit()
 
@@ -192,6 +203,7 @@ class Store:
             "text": row[4],
             "media_path": row[5],
             "media_type": row[6],
+            "sender_label": row[7] if len(row) > 7 else None,
         }
 
     async def delete_message(self, connection_id: str, message_id: int) -> None:
@@ -293,14 +305,18 @@ async def save_media(
     media_type, file_id = extract_media(message)
     if not file_id:
         return None, None
-    file_info = await api.get_file(file_id)
-    remote_path = file_info.get("file_path")
-    if not remote_path:
-        return None, None
-    dest_dir = media_dir / connection_id
-    dest_path = dest_dir / Path(remote_path).name
-    await api.download_file(remote_path, dest_path)
-    return str(dest_path), media_type
+    try:
+        file_info = await api.get_file(file_id)
+        remote_path = file_info.get("file_path")
+        if not remote_path:
+            return None, None
+        dest_dir = media_dir / connection_id
+        dest_path = dest_dir / Path(remote_path).name
+        await api.download_file(remote_path, dest_path)
+        return str(dest_path), media_type
+    except Exception as exc:  # noqa: BLE001
+        print(f"Не удалось скачать медиа: {exc}")
+        return None, media_type
 
 
 def sender_label(message: Dict[str, Any]) -> str:
@@ -310,11 +326,14 @@ def sender_label(message: Dict[str, Any]) -> str:
     last = sender.get("last_name")
     uid = sender.get("id")
     name_parts = [p for p in [first, last] if p]
+    base = None
     if name_parts:
-        return f"{' '.join(name_parts)} ({uid})"
-    if username:
-        return f"@{username} ({uid})"
-    return f"user {uid}"
+        base = " ".join(name_parts)
+    elif username:
+        base = f"@{username}"
+    else:
+        base = "user"
+    return f"{base} (id: {uid})"
 
 
 def user_allowed(user_id: int, settings: Settings) -> bool:
@@ -374,6 +393,7 @@ async def handle_business_message(
         return
 
     text = bm.get("text") or bm.get("caption") or ""
+    label = sender_label(bm)
     media_path, media_type = await save_media(api, bm, settings.media_dir, connection_id)
     await store.upsert_message(
         connection_id=connection_id,
@@ -383,13 +403,19 @@ async def handle_business_message(
         text=text,
         media_path=media_path,
         media_type=media_type,
+        sender_label=label,
     )
 
     if settings.forward_media_immediately and media_path and owner_chat:
-        caption = f"Медиа из чата {chat_id} от {sender_label(bm)}"
+        caption = f"Медиа из чата {chat_id} от {label}"
         await api.send_media_by_type(owner_chat, media_type or "document", Path(media_path), caption=caption)
         if settings.clean_after_send:
             await store.delete_message(connection_id, message_id)
+    elif settings.forward_media_immediately and media_type and not media_path and owner_chat:
+        await api.send_message(
+            owner_chat,
+            f"{label} отправил(а) медиа, но не удалось скачать файл (тип: {media_type}).",
+        )
 
 
 async def handle_edited_business_message(
@@ -402,11 +428,14 @@ async def handle_edited_business_message(
         return
     old = await store.get_message(connection_id, message_id)
     new_text = ebm.get("text") or ebm.get("caption") or ""
+    label = sender_label(ebm)
     if old and old["text"] != new_text and owner_chat:
         before = old["text"] or "<пусто>"
         after = new_text or "<пусто>"
         body = (
-            f"Сообщение изменено (connection {connection_id}):\n\nДо:\n{before}\n\nПосле:\n{after}"
+            f"{label} изменил(а) сообщение:\n\n"
+            f"До:\n«{before}»\n\n"
+            f"После:\n«{after}»"
         )
         await api.send_message(owner_chat, body)
         if settings.clean_after_send:
@@ -420,6 +449,7 @@ async def handle_edited_business_message(
         text=new_text,
         media_path=old["media_path"] if old else None,
         media_type=old["media_type"] if old else None,
+        sender_label=old["sender_label"] if old else label,
     )
 
 
@@ -436,10 +466,11 @@ async def handle_deleted_business_messages(
         if not saved:
             continue
         text = saved["text"] or "<без текста>"
+        label = saved.get("sender_label") or f"user {saved.get('sender_id')}"
         body = (
-            f"Удалено сообщение (connection {connection_id})\n"
-            f"chat: {saved['chat_id']}\n\n"
-            f"Текст:\n{text}"
+            f"{label} удалил(а) сообщение:\n"
+            f"Чат: {saved['chat_id']}\n\n"
+            f"Текст:\n«{text}»"
         )
         await api.send_message(owner_chat, body)
         if saved["media_path"]:
@@ -467,7 +498,7 @@ async def run() -> None:
             "edited_business_message",
             "deleted_business_messages",
         ]
-        print("Бизнес-бот запущен. Ожидание событий...")
+        print("Business bot started. Waiting for updates...")
         while True:
             try:
                 updates = await api.get_updates(offset, settings.poll_timeout, allowed_updates)
