@@ -108,6 +108,18 @@ class Store:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_forwards (
+                prompt_chat_id INTEGER NOT NULL,
+                prompt_message_id INTEGER NOT NULL,
+                connection_id TEXT NOT NULL,
+                target_message_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (prompt_chat_id, prompt_message_id)
+            )
+            """
+        )
         # миграция: добавляем колонку sender_label при обновлении
         self._ensure_column("messages", "sender_label", "TEXT")
         self.conn.commit()
@@ -216,6 +228,40 @@ class Store:
             )
             self.conn.commit()
 
+    async def save_pending_forward(
+        self, prompt_chat_id: int, prompt_message_id: int, connection_id: str, target_message_id: int
+    ) -> None:
+        async with self.lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO pending_forwards (prompt_chat_id, prompt_message_id, connection_id, target_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (prompt_chat_id, prompt_message_id, connection_id, target_message_id),
+            )
+            self.conn.commit()
+
+    async def pop_pending_forward(self, prompt_chat_id: int, prompt_message_id: int) -> Optional[Tuple[str, int]]:
+        async with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT connection_id, target_message_id
+                FROM pending_forwards
+                WHERE prompt_chat_id = ? AND prompt_message_id = ?
+                """,
+                (prompt_chat_id, prompt_message_id),
+            )
+            row = cur.fetchone()
+            if row:
+                self.conn.execute(
+                    "DELETE FROM pending_forwards WHERE prompt_chat_id = ? AND prompt_message_id = ?",
+                    (prompt_chat_id, prompt_message_id),
+                )
+            self.conn.commit()
+        if not row:
+            return None
+        return row[0], row[1]
+
 
 # --- Bot API client ----------------------------------------------------------
 class BotAPI:
@@ -254,14 +300,16 @@ class BotAPI:
             },
         )
 
-    async def send_message(self, chat_id: int, text: str) -> None:
-        await self._request("sendMessage", params={"chat_id": chat_id, "text": text})
+    async def send_message(self, chat_id: int, text: str) -> Dict[str, Any]:
+        return await self._request("sendMessage", params={"chat_id": chat_id, "text": text})
 
-    async def send_message_fmt(self, chat_id: int, text: str, parse_mode: Optional[str] = None) -> None:
+    async def send_message_fmt(
+        self, chat_id: int, text: str, parse_mode: Optional[str] = None
+    ) -> Dict[str, Any]:
         params: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode:
             params["parse_mode"] = parse_mode
-        await self._request("sendMessage", params=params)
+        return await self._request("sendMessage", params=params)
 
     async def send_document(self, chat_id: int, file_path: Path, caption: Optional[str] = None) -> None:
         await self._request(
@@ -393,6 +441,39 @@ async def handle_start(api: BotAPI, store: Store, settings: Settings, message: D
     await api.send_message(chat_id, text)
 
 
+async def handle_owner_reply(api: BotAPI, store: Store, settings: Settings, message: Dict[str, Any]) -> None:
+    # Пользователь отвечает на сервисное сообщение бота, чтобы получить копию одноразового медиа
+    if not message.get("reply_to_message"):
+        return
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+    reply_to = message["reply_to_message"]
+    prompt_msg_id = reply_to.get("message_id")
+    if prompt_msg_id is None:
+        return
+    pending = await store.pop_pending_forward(chat_id, prompt_msg_id)
+    if not pending:
+        return
+    connection_id, target_message_id = pending
+    saved = await store.get_message(connection_id, target_message_id)
+    if not saved:
+        await api.send_message(chat_id, "Не удалось найти медиа для пересылки.")
+        return
+    if saved["media_path"]:
+        await api.send_media_by_type(
+            chat_id,
+            saved["media_type"] or "document",
+            Path(saved["media_path"]),
+            caption="Запрошенное медиа",
+        )
+    else:
+        await api.send_message(chat_id, "Медиа не сохранилось (view-once без file_id).")
+    if settings.clean_after_send:
+        await store.delete_message(connection_id, target_message_id)
+
+
 async def handle_business_connection(api: BotAPI, store: Store, settings: Settings, bc: Dict[str, Any]) -> None:
     connection_id = bc["id"]
     user = bc.get("user", {})
@@ -444,23 +525,32 @@ async def handle_business_message(
         sender_label=label,
     )
 
-    if settings.forward_media_immediately and owner_chat:
-        should_forward = is_ephemeral or not settings.forward_only_ephemeral
-        if should_forward and media_path:
+    # Обычные медиа пересылаем сразу только если явно разрешено и это не одноразовое
+    if (
+        settings.forward_media_immediately
+        and owner_chat
+        and not is_ephemeral
+        and not settings.forward_only_ephemeral
+    ):
+        if media_path:
             caption = f"Медиа из чата {chat_id} от {label}"
             await api.send_media_by_type(owner_chat, media_type or "document", Path(media_path), caption=caption)
             if settings.clean_after_send:
                 await store.delete_message(connection_id, message_id)
-        elif should_forward and media_type and not media_path:
+        elif media_type:
             await api.send_message(
                 owner_chat,
                 f"{label} отправил(а) медиа, но не удалось скачать файл (тип: {media_type}).",
             )
-        elif should_forward and not media_type:
-            await api.send_message(
-                owner_chat,
-                f"{label} отправил(а) одноразовое медиа, но Telegram не дал file_id (view-once/TTL).",
-            )
+
+    # Если одноразовое медиа: уведомляем и ждём ответа пользователя (reply), чтобы переслать
+    if is_ephemeral and owner_chat:
+        prompt = (
+            f"{html_escape(label)} прислал(а) одноразовое медиа.\n"
+            f"Ответьте на это сообщение, чтобы получить копию."
+        )
+        sent = await api.send_message_fmt(owner_chat, prompt, parse_mode="HTML")
+        await store.save_pending_forward(owner_chat, sent["message_id"], connection_id, message_id)
 
 
 async def handle_edited_business_message(
@@ -483,9 +573,6 @@ async def handle_edited_business_message(
             f"Новое:<blockquote>{html_escape(after)}</blockquote>"
         )
         await api.send_message_fmt(owner_chat, body, parse_mode="HTML")
-        if settings.clean_after_send:
-            await store.delete_message(connection_id, message_id)
-            return
     await store.upsert_message(
         connection_id=connection_id,
         message_id=message_id,
@@ -549,8 +636,11 @@ async def run() -> None:
                 updates = await api.get_updates(offset, settings.poll_timeout, allowed_updates)
                 for upd in updates:
                     offset = upd["update_id"] + 1
-                    if "message" in upd and upd["message"].get("text") == "/start":
-                        await handle_start(api, store, settings, upd["message"])
+                    if "message" in upd:
+                        if upd["message"].get("text") == "/start":
+                            await handle_start(api, store, settings, upd["message"])
+                        else:
+                            await handle_owner_reply(api, store, settings, upd["message"])
                     if "business_connection" in upd:
                         await handle_business_connection(api, store, settings, upd["business_connection"])
                     if "business_message" in upd:
